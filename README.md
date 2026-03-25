@@ -1,4 +1,4 @@
-# vLLM AMX vs No-AMX Benchmark
+# Intel AMX Demo with vLLM
 
 Benchmark and demo suite that quantifies the performance impact of **Intel Advanced Matrix Extensions (AMX)** on CPU-based LLM inference using [vLLM](https://github.com/vllm-project/vllm).
 
@@ -11,6 +11,18 @@ Two Docker images are built from the same vLLM source — one with AMX enabled, 
 - **Intel 4th-gen Xeon Scalable** (Sapphire Rapids) or later for AMX support
 - Docker with BuildKit enabled
 - Hugging Face account with access to the model (see [§ Environment Variables](#step-2--environment-variables))
+
+Verify that the host CPU exposes the required AMX flags:
+
+```bash
+grep -o 'amx[^ ]*' /proc/cpuinfo | sort -u
+# expected output:
+#   amx_bf16
+#   amx_int8
+#   amx_tile
+```
+
+If any of these flags are missing the AMX image will still run, but AMX tile units will not be available and results will be identical to the no-AMX container.
 
 ---
 
@@ -114,6 +126,48 @@ bash test_vLLM.sh
 # Show running containers and images
 bash show_docker.sh
 ```
+
+### Verify oneDNN kernel dispatch with `DNNL_VERBOSE`
+
+`DNNL_VERBOSE` controls oneDNN's kernel-selection logging. It is set to `0` (silent) by default in `start_amx_containers.sh`. To confirm that the AMX container is actually dispatching AMX kernels, restart it with `DNNL_VERBOSE=1`:
+
+```bash
+# Stop the running AMX container first
+docker stop vllm-amx
+
+# Relaunch with verbose oneDNN logging, capturing output
+docker run --rm \
+  --name vllm-amx-verbose \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -e HF_TOKEN=${HF_TOKEN} \
+  -e VLLM_CPU_KVCACHE_SPACE=40 \
+  -e VLLM_CPU_OMP_THREADS_BIND="0-19" \
+  -e DNNL_MAX_CPU_ISA=AVX512_CORE_AMX \
+  -e VLLM_CPU_SGL_KERNEL=1 \
+  -e DNNL_VERBOSE=1 \
+  -e LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/opt/venv/lib/libiomp5.so" \
+  --cap-add SYS_NICE \
+  --security-opt seccomp=unconfined \
+  --shm-size=4g \
+  -p 8000:8000 \
+  vllm-cpu-amx:latest \
+  --model ibm-granite/granite-3.3-8b-instruct \
+  --dtype bfloat16 2>&1 | grep -i "avx512_core_amx"
+```
+
+While the container is handling a request, lines like the following confirm AMX kernels are being dispatched:
+
+```
+dnnl_verbose,exec,cpu,matmul,...,avx512_core_amx,...
+```
+
+For the no-AMX container the same lines will show `avx512_core_bf16` instead — confirming AMX tile units are correctly disabled:
+
+```
+dnnl_verbose,exec,cpu,matmul,...,avx512_core_bf16,...
+```
+
+Set `DNNL_VERBOSE=0` (the default) for normal operation — verbose logging adds overhead and produces large amounts of output under load.
 
 ---
 
