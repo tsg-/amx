@@ -1,0 +1,1 @@
+docker build   -f docker/Dockerfile.cpu.no-amx   --build-arg VLLM_CPU_AMXBF16=0   --build-arg VLLM_CPU_AVX512BF16=1   --build-arg VLLM_CPU_AVX512VNNI=1   --tag vllm-cpu-no-amx:latest   --target vllm-openai  .

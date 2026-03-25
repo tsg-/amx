@@ -1,0 +1,145 @@
+# =============================================================================
+# vLLM CPU — AMX ENABLED (Intel Sapphire Rapids / Emerald Rapids)
+# Ubuntu 24.04 LTS, Python 3.12, gcc-13
+#
+# Build:
+#   git clone https://github.com/vllm-project/vllm.git
+#   cd vllm
+#   docker build \
+#     -f Dockerfile.cpu.amx \
+#     --build-arg VLLM_CPU_AMXBF16=1 \
+#     --build-arg VLLM_CPU_AVX512BF16=1 \
+#     --build-arg VLLM_CPU_AVX512VNNI=1 \
+#     --tag vllm-cpu-amx:latest \
+#     --target vllm-openai \
+#     .
+#
+# Run:
+#   docker run --rm -it \
+#     -v ~/.cache/huggingface:/root/.cache/huggingface \
+#     -e HF_TOKEN=<your_token> \
+#     -e VLLM_CPU_KVCACHE_SPACE=40 \
+#     -e VLLM_CPU_OMP_THREADS_BIND=0-$(( $(nproc) - 2 )) \
+#     -e DNNL_MAX_CPU_ISA=AVX512_CORE_AMX \
+#     -e VLLM_CPU_SGL_KERNEL=1 \
+#     --cap-add SYS_NICE \
+#     --security-opt seccomp=unconfined \
+#     --shm-size=4g \
+#     -p 8000:8000 \
+#     vllm-cpu-amx:latest \
+#     --model meta-llama/Llama-3.1-8B-Instruct \
+#     --dtype bfloat16
+# =============================================================================
+
+######################### COMMON BASE #########################
+FROM ubuntu:24.04 AS base-common
+
+WORKDIR /workspace/
+
+ARG PYTHON_VERSION=3.12
+ARG PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Ubuntu 24.04 ships gcc-13 by default — use it
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        sudo ccache git curl wget ca-certificates \
+        gcc g++ \
+        libtcmalloc-minimal4 libnuma-dev \
+        ffmpeg libsm6 libxext6 libgl1 \
+        jq lsof numactl \
+        # perf tooling useful for AMX validation
+        linux-tools-generic 2>/dev/null || true && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install uv (fast Python package manager used by upstream vLLM)
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+ENV CC=/usr/bin/gcc
+ENV CXX=/usr/bin/g++
+ENV CCACHE_DIR=/root/.cache/ccache
+ENV CMAKE_CXX_COMPILER_LAUNCHER=ccache
+ENV PATH="/root/.local/bin:$PATH"
+ENV VIRTUAL_ENV="/opt/venv"
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+ENV UV_HTTP_TIMEOUT=500
+ENV PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
+ENV UV_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
+ENV UV_INDEX_STRATEGY="unsafe-best-match"
+ENV UV_LINK_MODE="copy"
+
+RUN uv venv --python ${PYTHON_VERSION} --seed ${VIRTUAL_ENV}
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,src=requirements/common.txt,target=requirements/common.txt \
+    --mount=type=bind,src=requirements/cpu.txt,target=requirements/cpu.txt \
+    uv pip install --upgrade pip && \
+    uv pip install -r requirements/cpu.txt
+
+######################### x86_64 BASE #########################
+FROM base-common AS base-amd64
+
+# TCMalloc + Intel OpenMP for AMX path — significant perf boost
+ENV LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/opt/venv/lib/libiomp5.so"
+
+######################### BUILD #########################
+FROM base-amd64 AS vllm-build
+
+ARG max_jobs=32
+ENV MAX_JOBS=${max_jobs}
+
+# ---- AMX: ALL FLAGS ENABLED ----
+ARG VLLM_CPU_DISABLE_AVX512=0
+ENV VLLM_CPU_DISABLE_AVX512=${VLLM_CPU_DISABLE_AVX512}
+
+ARG VLLM_CPU_AVX512=1
+ENV VLLM_CPU_AVX512=${VLLM_CPU_AVX512}
+
+ARG VLLM_CPU_AVX512BF16=1
+ENV VLLM_CPU_AVX512BF16=${VLLM_CPU_AVX512BF16}
+
+ARG VLLM_CPU_AVX512VNNI=1
+ENV VLLM_CPU_AVX512VNNI=${VLLM_CPU_AVX512VNNI}
+
+# AMXBF16=1 is the key flag — enables tile matrix multiply units
+ARG VLLM_CPU_AMXBF16=1
+ENV VLLM_CPU_AMXBF16=${VLLM_CPU_AMXBF16}
+
+WORKDIR /workspace/vllm
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,src=requirements/cpu-build.txt,target=requirements/build.txt \
+    uv pip install -r requirements/build.txt
+
+COPY . .
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cache/ccache \
+    --mount=type=cache,target=/workspace/vllm/.deps,sharing=locked \
+    --mount=type=bind,source=.git,target=.git \
+    VLLM_TARGET_DEVICE=cpu python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38
+
+######################### RELEASE IMAGE #########################
+FROM base-amd64 AS vllm-openai
+
+WORKDIR /workspace/
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,from=vllm-build,src=/workspace/vllm/dist,target=dist \
+    uv pip install dist/*.whl
+
+# Runtime defaults for AMX path
+# Override per-container with -e flags if needed
+ENV DNNL_MAX_CPU_ISA=AVX512_CORE_AMX
+ENV VLLM_CPU_SGL_KERNEL=1
+
+# Label for identification
+LABEL vllm.isa="amx" \
+      vllm.platform="cpu" \
+      vllm.base="ubuntu24.04"
+
+ENTRYPOINT ["vllm", "serve"]

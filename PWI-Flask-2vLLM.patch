@@ -1,0 +1,289 @@
+--- /tmp/PWI-Flask-2vLLM.orig.py	2026-03-22 22:20:13.275820464 -0700
++++ /tmp/PWI-Flask-2vLLM.new.py	2026-03-22 22:21:17.155159507 -0700
+@@ -14,13 +14,49 @@
+ # Model name
+ VLLM_MODEL = "ibm-granite/granite-3.3-8b-instruct"
+ 
+-# Predefined questions
++# Predefined questions — use long-context prompts so prefill dominates and AMX advantage is visible
++CONTEXT_DOC = """
++Intel Advanced Matrix Extensions (AMX) is an x86 ISA extension introduced in Intel Xeon Scalable
++processors (Sapphire Rapids and later). AMX adds eight 2D tile registers (each 16 rows × 64 bytes)
++and a set of TMUL instructions that perform a full 16×16 BF16 matrix multiply-accumulate in a
++single instruction, delivering up to 2048 BF16 MACs per cycle per core. This is a significant
++improvement over AVX-512 BF16 VNNI, which processes 4×16 BF16 dot products per instruction.
++
++In transformer-based LLM inference there are two distinct phases. The prefill phase processes
++the entire input prompt simultaneously: it computes query, key, and value projections (three large
++GEMMs over hidden_size × sequence_length), self-attention scores, and all feed-forward network
++layers. Because the full sequence is processed in parallel, prefill consists of large matrix
++multiplications — exactly the compute-bound workload AMX tile instructions are designed for.
++
++The decode phase generates one token at a time via autoregressive sampling. Each step performs
++a matrix-vector multiply (sequence length 1 against the full weight matrices), which is
++memory-bandwidth bound: the bottleneck is loading weight matrices from DRAM, not arithmetic
++throughput. AMX provides no benefit here; both AMX and non-AMX cores are equally limited by
++DRAM bandwidth.
++
++As a result, AMX delivers its performance advantage primarily through TTFT (time to first token),
++which measures prefill latency. For workloads with long input contexts and short outputs — such as
++retrieval-augmented generation (RAG), document summarisation, code review, and classification —
++prefill constitutes a large fraction of total request time, making TTFT a user-visible latency
++metric. Benchmarks on Granite-3.3-8B show approximately 6× faster prefill throughput with AMX
++compared to AVX-512 BF16 only, translating to a 3× end-to-end speedup for a 2600-token prompt
++with 50-token output.
++"""
++
+ QUESTIONS = [
+-    "What types of computations are most predominate in AI/ML?",
+-    "Tell me a joke that only a Technologist would get.",
+-    "Summarize the concept of Machine Learning.",
+-    "What is the difference between TCP and UDP?",
+-    "Why does a high CPU tCase complication air cooling?"
++    CONTEXT_DOC + "\nIn 2-3 sentences, explain why AMX improves TTFT but not decode throughput.",
++    CONTEXT_DOC + "\nIn 2-3 sentences, what workloads benefit most from AMX in LLM inference?",
++    CONTEXT_DOC + "\nIn 2-3 sentences, compare prefill and decode phases in transformer inference.",
++    CONTEXT_DOC + "\nIn 2-3 sentences, explain what TTFT measures and why it matters to users.",
++    CONTEXT_DOC + "\nIn 2-3 sentences, describe how AMX tile registers differ from AVX-512 VNNI.",
++]
++
++QUESTION_LABELS = [
++    "Why does AMX improve TTFT but not decode?",
++    "What workloads benefit most from AMX?",
++    "Compare prefill and decode phases.",
++    "What is TTFT and why does it matter?",
++    "How do AMX tiles differ from AVX-512 VNNI?",
+ ]
+ 
+ # HTML template
+@@ -39,14 +75,19 @@
+         25%, 75% { opacity: 0; }
+           }
+       .blinking {
+-        color: white;               /* Text color */
+-        font-weight: bold;        /* Make it bold */
+-        animation: blink 1s infinite; /* Apply animation */
++        color: white;
++        font-weight: bold;
++        animation: blink 1s infinite;
+           }
+       .circle { border-radius: 50%; }
+       .rounded { border-radius: 15px; }
+         #answer { margin-top: 20px; padding: 10px; background: #f0f0f0; white-space: pre-wrap; }
+-        #metrics { margin-top: 10px; font-size: 0.9em; color: white; }
++        .metrics-box { margin-top: 10px; font-size: 0.9em; color: white; }
++        .response-col { display: inline-block; vertical-align: top; width: 48%; margin: 1%; }
++        .response-col h3 { color: white; }
++        .response-text { max-height: 150px; background-color: lightblue; overflow: auto;
++                         border: 1px solid black; padding: 8px; white-space: pre-wrap; }
++        .metric-highlight { font-size: 1.2em; font-weight: bold; color: #ffff00; }
+     </style>
+ </head>
+ <body style="background-color: #0071C5;">
+@@ -58,77 +99,98 @@
+ 
+     <table cellspacing="5" >
+ 
+-    <TH style="background-color: #33ff56;"><label for="service"><B>1.</B> Select vLLM Service:</label></TD>
+-    <TH style="background-color: #33ff58; width: 300px"><label for="question"><B>2.</B> Select a Question:</label></TD>
++    <TH style="background-color: #33ff58; width: 300px"><label for="question"><B>1.</B> Select a Question:</label></TD>
+     <TH class="blinking" style="width: 140px">Click to Start:</TD>
+     <TH rowspan="2" style="width: 300px"><img src="/static/intel-logo.jpg" alt="Intel Corporation Logo" width="240" height="100" class="rounded"></TD>
+ 
+     <TR>
+ 
+     <TD>
+-    <select id="service">
+-        {% for name in services %}
+-            <option value="{{ name }}">{{ name }}</option>
+-        {% endfor %}
+-    </select>
+-    </TD>
+-
+-    <TD>
+     <select id="question">
+         <option value="">-- Please choose --</option>
+-        {% for q in questions %}
+-            <option value="{{ q }}">{{ q }}</option>
++        {% for label, q in question_pairs %}
++            <option value="{{ q }}">{{ label }}</option>
+         {% endfor %}
+     </select>
+     </TD>
+ 
+     <TD>
+-    <button id="askBtn"><B>ASK</B></button>
++    <button id="askBtn"><B>ASK BOTH</B></button>
+     </TD>
+ 
+     </table>
+ 
+     <br>
+ 
+-    <B><UL>vLLM Response:</UL></B>
++    <B><UL>vLLM Response (side-by-side):</UL></B>
+ 
+-    <div id="answer" style="width:1020px; max-height:150px; background-color:lightblue; overflow: auto; border:1px solid black;"></div>
+-    <div id="metrics"></div>
++    <div style="width: 1040px;">
++        <div class="response-col">
++            <h3>&#9989; AMX (Port 8000)</h3>
++            <div id="answer-amx" class="response-text"></div>
++            <div id="metrics-amx" class="metrics-box"></div>
++        </div>
++        <div class="response-col">
++            <h3>&#10060; No AMX / AVX-512 (Port 8001)</h3>
++            <div id="answer-noamx" class="response-text"></div>
++            <div id="metrics-noamx" class="metrics-box"></div>
++        </div>
++    </div>
+ 
+     <script>
++        function formatMetrics(m) {
++            const prefill = m.prompt_tokens && m.time_to_first_token > 0
++                ? (m.prompt_tokens / m.time_to_first_token).toFixed(0) + " tok/s"
++                : "n/a";
++            return `TTFT: ${(m.time_to_first_token).toFixed(2)}s | ` +
++                   `Total: ${m.total_time.toFixed(2)}s | ` +
++                   `Prefill: ${prefill} | ` +
++                   `Decode: ${m.tokens_per_second.toFixed(1)} tok/s`;
++        }
++
+         document.getElementById("askBtn").addEventListener("click", function() {
+-            document.getElementById("answer").textContent = "";
+-            document.getElementById("metrics").textContent = "";
++            document.getElementById("answer-amx").textContent = "";
++            document.getElementById("answer-noamx").textContent = "";
++            document.getElementById("metrics-amx").textContent = "";
++            document.getElementById("metrics-noamx").textContent = "";
+ 
+-            const service = document.getElementById("service").value;
+             const question = document.getElementById("question").value;
+-
+-            if (!service || !question) {
+-                document.getElementById("metrics").textContent = "Please select both a service and a question.";
++            if (!question) {
++                document.getElementById("metrics-amx").textContent = "Please select a question.";
+                 return;
+             }
+ 
+-            const eventSource = new EventSource(`/stream?service=${encodeURIComponent(service)}&question=${encodeURIComponent(question)}`);
++            // Cache-bust: unique timestamp suffix so vLLM prefix cache doesn't serve stale KV
++            const bust = Date.now();
+ 
+-            eventSource.onmessage = function(event) {
++            // Stream AMX
++            const esAmx = new EventSource(
++                `/stream?service=${encodeURIComponent("vLLM with AMX (Port 8000)")}&question=${encodeURIComponent(question)}&bust=${bust}a`
++            );
++            esAmx.onmessage = function(event) {
+                 const data = JSON.parse(event.data);
+-                if (data.token) {
+-                    document.getElementById("answer").textContent += data.token;
+-                }
+-                if (data.metrics) {
+-                    document.getElementById("metrics").textContent =
+-                        `Time to first token: ${data.metrics.time_to_first_token.toFixed(2)}s | ` +
+-                        `Total time: ${data.metrics.total_time.toFixed(2)}s | ` +
+-                        `Tokens/sec: ${data.metrics.tokens_per_second.toFixed(2)}`;
+-                }
+-                if (data.done) {
+-                    eventSource.close();
+-                }
++                if (data.token) document.getElementById("answer-amx").textContent += data.token;
++                if (data.metrics) document.getElementById("metrics-amx").textContent = formatMetrics(data.metrics);
++                if (data.done) esAmx.close();
++            };
++            esAmx.onerror = function() {
++                document.getElementById("metrics-amx").textContent = "Error streaming from AMX.";
++                esAmx.close();
+             };
+ 
+-            eventSource.onerror = function() {
+-                document.getElementById("metrics").textContent = "Error streaming from server.";
+-                eventSource.close();
++            // Stream No-AMX
++            const esNoAmx = new EventSource(
++                `/stream?service=${encodeURIComponent("vLLM No AMX (Port 8001)")}&question=${encodeURIComponent(question)}&bust=${bust}b`
++            );
++            esNoAmx.onmessage = function(event) {
++                const data = JSON.parse(event.data);
++                if (data.token) document.getElementById("answer-noamx").textContent += data.token;
++                if (data.metrics) document.getElementById("metrics-noamx").textContent = formatMetrics(data.metrics);
++                if (data.done) esNoAmx.close();
++            };
++            esNoAmx.onerror = function() {
++                document.getElementById("metrics-noamx").textContent = "Error streaming from No-AMX.";
++                esNoAmx.close();
+             };
+         });
+     </script>
+@@ -138,12 +200,16 @@
+ 
+ @app.route("/")
+ def home():
+-    return render_template_string(HTML_PAGE, questions=QUESTIONS, services=VLLM_SERVICES.keys())
++    return render_template_string(
++        HTML_PAGE,
++        question_pairs=zip(QUESTION_LABELS, QUESTIONS),
++    )
+ 
+ @app.route("/stream", methods=["GET"])
+ def stream():
+     service_name = request.args.get("service")
+     question = request.args.get("question", "").strip()
++    bust = request.args.get("bust", "")
+ 
+     if not service_name or service_name not in VLLM_SERVICES:
+         return "Invalid service", 400
+@@ -156,18 +222,23 @@
+         start_time = time.time()
+         first_token_time = None
+         token_count = 0
++        prompt_tokens = 0
++
++        # Append bust token to question to defeat vLLM prefix caching
++        busted_question = f"[{bust}] {question}" if bust else question
+ 
+         payload = {
+             "model": VLLM_MODEL,
+-            "messages": [{"role": "user", "content": question}],
+-            "max_tokens": 300,
++            "messages": [{"role": "user", "content": busted_question}],
++            "max_tokens": 50,
+             "temperature": 0,
+             "seed": 12345,
+-            "stream": True
++            "stream": True,
++            "stream_options": {"include_usage": True},
+         }
+ 
+         try:
+-            with requests.post(api_url, json=payload, stream=True, timeout=60) as r:
++            with requests.post(api_url, json=payload, stream=True, timeout=120) as r:
+                 r.raise_for_status()
+                 for line in r.iter_lines(decode_unicode=True):
+                     if not line or not line.startswith("data:"):
+@@ -179,12 +250,16 @@
+                         metrics = {
+                             "time_to_first_token": (first_token_time - start_time) if first_token_time else 0,
+                             "total_time": total_time,
+-                            "tokens_per_second": tokens_per_second
++                            "tokens_per_second": tokens_per_second,
++                            "prompt_tokens": prompt_tokens,
+                         }
+                         yield f"data: {json.dumps({'done': True, 'metrics': metrics})}\n\n"
+                         break
+                     try:
+                         data_json = json.loads(data_str)
++                        # Capture prompt token count from usage chunk
++                        if "usage" in data_json and data_json["usage"]:
++                            prompt_tokens = data_json["usage"].get("prompt_tokens", prompt_tokens)
+                         token = data_json["choices"][0]["delta"].get("content", "")
+                         if token:
+                             token_count += 1
+@@ -200,4 +275,3 @@
+ 
+ if __name__ == "__main__":
+     app.run(debug=True, host="0.0.0.0", port=5001)
+-
