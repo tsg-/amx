@@ -43,7 +43,8 @@ If any of these flags are missing the AMX image will still run, but AMX tile uni
 ├── benchmark_amx.sh          # Automated benchmark runner (wraps query_vllm_amx.py)
 ├── query_vllm_amx.py         # Python benchmark client — TTFT, prefill tok/s, decode tok/s
 ├── PWI-Flask-2vLLM.py        # Flask demo app v1 — select service & question in browser
-└── PWI-Flask-2vLLM-v2.py     # Flask demo app v2 — multi-run, cache-busted, richer metrics
+├── PWI-Flask-2vLLM-v2.py     # Flask demo app v2 — multi-run, cache-busted, richer metrics
+└── PWI-Flask-2vLLM-v3.py     # Flask demo app v3 — SSE streaming UI, speedup banner, metric cards, CPU auto-detect
 ```
 
 ---
@@ -355,6 +356,29 @@ This is what makes the no-AMX container a clean baseline — same Sapphire Rapid
 The core insight driving every design decision:
 
 > **AMX accelerates GEMM (matrix multiply). During LLM inference, GEMM only dominates during prefill — not decode.**
+
+#### Real-life scenarios where AMX matters
+
+The benchmark is modelled on workloads on these workloads where TTFT is material.
+
+| Workload | Typical prompt length | Why TTFT matters |
+|---|---|---|
+| **RAG / document Q&A** | 2,000–8,000 tokens (retrieved chunks + question) | User is waiting for the first sentence of an answer; a 25 s wait vs 7.5 s is the difference between a useful tool and an abandoned one |
+| **Code review / explanation** | 1,000–4,000 tokens (full file or diff) | Developer is blocked; TTFT determines whether the assistant feels interactive |
+| **Document summarisation** | 4,000–16,000 tokens (contract, report, paper) | Batch job latency directly multiplied by volume; a 6× TTFT gain cuts per-document time proportionally |
+| **Classification / routing** | 500–2,000 tokens (email, ticket, form) | High-throughput pipeline; each request is independent so TTFT ≈ total latency |
+| **Chat with long history** | 2,000–8,000 tokens (prior turns) | Conversation context grows with each turn; TTFT degrades linearly without AMX |
+
+In all of these, the output is short (a summary sentence, a yes/no classification, the first paragraph of an answer) which `max_tokens=50` models. The input is long — exactly what the ~2,600-token `CONTEXT_DOC` prefix models.
+
+Contrast with workloads where AMX provides less end-to-end benefit:
+
+| Workload | Characteristic | Expected AMX impact |
+|---|---|---|
+| **Creative writing / long-form generation** | Short prompt, hundreds of tokens of output | Decode-dominated; AMX helps TTFT only, which is now a small fraction of total time |
+| **Simple chat completion** | Single short question, single short answer | Both prefill and decode are small; latency is dominated by network and scheduling overhead |
+| **Batch offline generation** | Throughput is the metric, not latency | DRAM bandwidth-bound; AMX neutral on overall throughput |
+
 
 #### Metric: TTFT, not throughput
 
