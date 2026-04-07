@@ -294,3 +294,98 @@ The **50-150 token output / 2,600-token prompt** scenario is the most honest dem
 ## License
 
 See [LICENSE](LICENSE).
+
+---
+
+## Appendix
+
+### A — What Flags and Libraries Are Required for AMX
+
+AMX activation requires alignment at three layers: compile time, runtime environment, and the ISA governor.
+
+#### 1. Compile-time build flags
+
+Passed as `--build-arg` to Docker and forwarded to vLLM's CPU backend build:
+
+| Flag | AMX value | No-AMX value | Effect |
+|---|---|---|---|
+| `VLLM_CPU_AMXBF16` | `1` | `0` | Compiles `-mamx-bf16` into the GEMM kernels |
+| `VLLM_CPU_AVX512BF16` | `1` | `1` | Both images retain the AVX-512 BF16 baseline |
+| `VLLM_CPU_AVX512VNNI` | `1` | `1` | Same |
+| `VLLM_CPU_DISABLE_AVX512` | `0` | `0` | AVX-512 enabled in both |
+
+`VLLM_CPU_AMXBF16=1` is the critical flag — it controls whether the compiler emits `TMUL` tile instructions in the oneDNN matmul kernels.
+
+#### 2. Runtime library: Intel OpenMP (`libiomp5.so`)
+
+This is the most subtle requirement. `Dockerfile.cpu.amx` sets:
+
+```
+LD_PRELOAD=".../libtcmalloc_minimal.so.4:/opt/venv/lib/libiomp5.so"
+```
+
+while `Dockerfile.cpu.no-amx` sets only:
+
+```
+LD_PRELOAD=".../libtcmalloc_minimal.so.4"   # libiomp5.so intentionally absent
+```
+
+Intel's OpenMP runtime is what activates the AMX tile-unit codepath inside oneDNN. Without it, even a binary compiled with `-mamx-bf16` will not use the tile registers because the kernel-dispatching logic won't select the AMX kernel. The no-AMX image deliberately excludes `libiomp5.so` to guarantee isolation.
+
+#### 3. Runtime ISA governor: `DNNL_MAX_CPU_ISA`
+
+oneDNN has a software cap on the ISA it will dispatch to, independent of what the CPU supports:
+
+| Container | Setting | Effect |
+|---|---|---|
+| AMX | `DNNL_MAX_CPU_ISA=AVX512_CORE_AMX` | Allows tile GEMM dispatch |
+| No-AMX | `DNNL_MAX_CPU_ISA=AVX512_CORE_BF16` | Hard-caps below AMX even on AMX-capable hardware |
+
+This is what makes the no-AMX container a clean baseline — same Sapphire Rapids hardware, same model weights, but `DNNL_MAX_CPU_ISA` prevents oneDNN from ever selecting the AMX kernel.
+
+#### 4. Supplementary runtime settings
+
+- `VLLM_CPU_SGL_KERNEL=1` — enables vLLM's single-graph kernel path, optimised to flow through oneDNN's AMX codepath.
+- `--cap-add SYS_NICE` + `--security-opt seccomp=unconfined` — required for `numactl` and OpenMP thread affinity (`VLLM_CPU_OMP_THREADS_BIND`). Without proper NUMA binding the memory access pattern undermines the GEMM benefit.
+
+---
+
+### B — Test Design Rationale to Showcase AMX Value
+
+The core insight driving every design decision:
+
+> **AMX accelerates GEMM (matrix multiply). During LLM inference, GEMM only dominates during prefill — not decode.**
+
+#### Metric: TTFT, not throughput
+
+TTFT (time to first token) equals prefill latency. It is the only end-to-end metric directly and exclusively determined by GEMM speed. Decode throughput is memory-bandwidth bound (loading weight matrices from DRAM), so it is the same on both containers — which the benchmark explicitly verifies and displays as a "neutral" result.
+
+#### Long-context prompts (~2,600 tokens)
+
+Both `query_vllm_amx.py` and the Flask app prepend a ~350-token technical document before each question:
+
+- Short prompts → prefill is a small fraction of total time → AMX advantage is diluted.
+- Long prompts → prefill dominates → the GEMM speedup shows up clearly in TTFT.
+
+`CONTEXT_DOC` in the Flask app is sized to produce roughly 2,600 prompt tokens, which the benchmark results confirm delivers a consistent ~6× TTFT speedup.
+
+#### Low `max_tokens=50` (default)
+
+Decode is kept short intentionally. With 50 output tokens and ~2,600 prompt tokens, prefill is ~46% of total wall time (the RAG sweet spot), giving ~3× end-to-end speedup. Generating 500 tokens would let the AMX-neutral decode phase dominate and dilute the measured result.
+
+#### Cache busting per run
+
+vLLM's prefix KV cache reuses pre-computed KV state for repeated prompts, collapsing TTFT to near zero and making AMX look no faster than no-AMX. Both tools inject a unique run ID at the **front** of every message:
+
+- CLI (`query_vllm_amx.py`): `f"{prompt} [run {i+1}]"`
+- Flask app: `f"[uid:{timestamp}_{run}] {question}"`
+
+Placement at the front of the message is important — a suffix would still allow the shared prefix to be cached.
+
+#### Sequential execution (not concurrent)
+
+AMX and no-AMX containers run one at a time on the same machine. Concurrent execution would cause both containers to compete for DRAM bandwidth — adding noise to the one metric (decode TPS) that should show parity, and potentially inflating the TTFT delta with memory contention rather than ISA difference.
+
+#### Multiple runs + P95 reporting
+
+Three runs by default with a cooldown between each. The first run of a cold container is often slower due to OS page faults loading model weights into DRAM; subsequent runs hit warm memory. Reporting P95 alongside the average confirms that worst-case latency is improved, not only the mean.
