@@ -9,6 +9,7 @@ docker run -d --rm \
   -e VLLM_CPU_OMP_THREADS_BIND="0-19" \
   -e DNNL_MAX_CPU_ISA=AVX512_CORE_AMX \
   -e VLLM_CPU_SGL_KERNEL=1 \
+  -e DNNL_VERBOSE=0 \
   -e LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/opt/venv/lib/libiomp5.so" \
   --cap-add SYS_NICE \
   --security-opt seccomp=unconfined \
@@ -28,6 +29,7 @@ docker run -d --rm \
   -e DNNL_MAX_CPU_ISA=AVX512_CORE_BF16 \
   -e ONEDNN_MAX_CPU_ISA=AVX512_CORE_BF16 \
   -e VLLM_CPU_SGL_KERNEL=0 \
+  -e DNNL_VERBOSE=0 \
   -e LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/opt/venv/lib/libiomp5.so" \
   --cap-add SYS_NICE \
   --security-opt seccomp=unconfined \

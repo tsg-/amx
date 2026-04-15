@@ -1,0 +1,223 @@
+# docker-compose.rag.yml
+# ----------------------
+# Full RAG + AMX demo stack:
+#   - Milvus standalone vector DB
+#   - vLLM LLM containers (AMX on :8000, no-AMX on :8001)   ← existing
+#   - vLLM embedding containers (AMX on :8002, no-AMX on :8003) ← new
+#
+# Prerequisites:
+#   docker build -f Dockerfile.cpu.amx    -t vllm-cpu-amx:latest    .   (inside vllm/ clone)
+#   docker build -f Dockerfile.cpu.no-amx -t vllm-cpu-no-amx:latest .
+#   export HF_TOKEN=hf_...
+#   export VLLM_LLM_MODEL=ibm-granite/granite-3.3-8b-instruct
+#   export VLLM_EMBED_MODEL=BAAI/bge-m3
+#
+# Usage:
+#   docker compose -f docker-compose.rag.yml up -d
+#   docker compose -f docker-compose.rag.yml down
+
+services:
+  # ---------------------------------------------------------------------------
+  # Milvus standalone — vector DB
+  # ---------------------------------------------------------------------------
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.18
+    container_name: milvus-etcd
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/etcd:/etcd
+    command: >
+      etcd
+      -advertise-client-urls=http://127.0.0.1:2379
+      -listen-client-urls http://0.0.0.0:2379
+      --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  minio:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    container_name: milvus-minio
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "9001:9001"
+      - "9000:9000"
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  milvus:
+    image: milvusdb/milvus:v2.5.10
+    container_name: milvus-standalone
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/milvus:/var/lib/milvus
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    depends_on:
+      - etcd
+      - minio
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # vLLM LLM inference containers (existing — chat completions)
+  # AMX: port 8000 | No-AMX: port 8001
+  # ---------------------------------------------------------------------------
+  vllm-amx:
+    image: vllm-cpu-amx:latest
+    container_name: vllm-amx
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      HF_TOKEN: ${HF_TOKEN}
+      VLLM_CPU_KVCACHE_SPACE: "40"
+      VLLM_CPU_OMP_THREADS_BIND: "0-19"
+      DNNL_MAX_CPU_ISA: AVX512_CORE_AMX
+      VLLM_CPU_SGL_KERNEL: "1"
+      DNNL_VERBOSE: "0"
+      LD_PRELOAD: "/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/opt/venv/lib/libiomp5.so"
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
+    shm_size: "4g"
+    ports:
+      - "8000:8000"
+    command:
+      - ${VLLM_LLM_MODEL:-ibm-granite/granite-3.3-8b-instruct}
+      - --dtype
+      - bfloat16
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+
+  vllm-no-amx:
+    image: vllm-cpu-no-amx:latest
+    container_name: vllm-no-amx
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      HF_TOKEN: ${HF_TOKEN}
+      VLLM_CPU_KVCACHE_SPACE: "40"
+      VLLM_CPU_OMP_THREADS_BIND: "20-39"
+      DNNL_MAX_CPU_ISA: AVX512_CORE_BF16
+      VLLM_CPU_SGL_KERNEL: "1"
+      DNNL_VERBOSE: "0"
+      LD_PRELOAD: "/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/opt/venv/lib/libiomp5.so"
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
+    shm_size: "4g"
+    ports:
+      - "8001:8001"
+    command:
+      - ${VLLM_LLM_MODEL:-ibm-granite/granite-3.3-8b-instruct}
+      - --dtype
+      - bfloat16
+      - --port
+      - "8001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+
+  # ---------------------------------------------------------------------------
+  # vLLM embedding containers (new — vector encoding for RAG indexing)
+  # AMX: port 8002 | No-AMX: port 8003
+  # BAAI/bge-m3 is a 570M-param embedding model — lightweight vs 8B LLM,
+  # still large enough to show AMX benefit on GEMM-heavy transformer layers.
+  # ---------------------------------------------------------------------------
+  vllm-embed-amx:
+    image: vllm-cpu-amx:latest
+    container_name: vllm-embed-amx
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      HF_TOKEN: ${HF_TOKEN}
+      VLLM_CPU_KVCACHE_SPACE: "10"
+      VLLM_CPU_OMP_THREADS_BIND: "0-9"
+      DNNL_MAX_CPU_ISA: AVX512_CORE_AMX
+      VLLM_CPU_SGL_KERNEL: "1"
+      DNNL_VERBOSE: "0"
+      LD_PRELOAD: "/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/opt/venv/lib/libiomp5.so"
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
+    shm_size: "2g"
+    ports:
+      - "8002:8002"
+    command:
+      - ${VLLM_EMBED_MODEL:-BAAI/bge-m3}
+      - --task
+      - embed
+      - --dtype
+      - bfloat16
+      - --port
+      - "8002"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+
+  vllm-embed-no-amx:
+    image: vllm-cpu-no-amx:latest
+    container_name: vllm-embed-no-amx
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      HF_TOKEN: ${HF_TOKEN}
+      VLLM_CPU_KVCACHE_SPACE: "10"
+      VLLM_CPU_OMP_THREADS_BIND: "10-19"
+      DNNL_MAX_CPU_ISA: AVX512_CORE_BF16
+      VLLM_CPU_SGL_KERNEL: "1"
+      DNNL_VERBOSE: "0"
+      LD_PRELOAD: "/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/opt/venv/lib/libiomp5.so"
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
+    shm_size: "2g"
+    ports:
+      - "8003:8003"
+    command:
+      - ${VLLM_EMBED_MODEL:-BAAI/bge-m3}
+      - --task
+      - embed
+      - --dtype
+      - bfloat16
+      - --port
+      - "8003"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
