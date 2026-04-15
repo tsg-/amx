@@ -2,11 +2,40 @@
 
 Benchmark and demo suite that quantifies the performance impact of **Intel Advanced Matrix Extensions (AMX)** across the full CPU-based AI inference stack:
 
-- **LLM Inference** — TTFT, prefill throughput, decode throughput on [vLLM](https://github.com/vllm-project/vllm)
-- **Embedding Generation** — document encoding throughput for vector database indexing
-- **End-to-end RAG** — embed → [Milvus](https://milvus.io/) similarity search → LLM answer latency
+| Demo | What it measures | Files |
+|---|---|---|
+| **LLM Inference** | TTFT, prefill tok/s, decode tok/s | `query_vllm_amx.py`, `PWI-Flask-2vLLM-v2.py` |
+| **Embedding & Indexing** | Document encoding throughput for vector DB | `rag_index_amx.py` |
+| **End-to-end RAG** | Embed → [Milvus](https://milvus.io/) search → LLM answer latency | `rag_query_amx.py`, `PWI-Flask-RAG.py` |
 
-Two Docker images are built from the same vLLM source — one with AMX enabled, one without — and run side-by-side so every comparison happens on identical hardware.
+The same two Docker images power every comparison — AMX enabled on one, disabled on the other — so results reflect the ISA difference only, not hardware variance.
+
+---
+
+## Why RAG Is the Best AMX Showcase
+
+RAG workloads combine two operations where AMX shines and one where it doesn't:
+
+```
+Long retrieved context                        Short answer
+(2,000–4,000 tokens)                         (50–200 tokens)
+        │                                           │
+        ▼                                           ▼
+  PREFILL PHASE                            DECODE PHASE
+  (process full prompt)                    (one token at a time)
+  Compute-bound GEMM ← AMX 6× faster      Memory-bandwidth bound
+  Large matrix multiply                    Matrix-vector multiply
+  AMX tile instructions ✅                 DRAM throughput bottleneck ❌
+```
+
+**Why RAG specifically:**
+- **Embedding generation** (encoding documents and queries) is pure transformer inference — the same compute-bound GEMM as LLM prefill. AMX accelerates it ~3–6×.
+- **LLM prefill** over the retrieved context (~2,600 tokens) is the dominant latency. AMX delivers ~6× TTFT speedup here.
+- **Short answer** (50 tokens) keeps decode time small, so the prefill AMX win carries through to a **~3× end-to-end speedup** the user can feel (7.5 s → 25 s).
+- Long decode outputs dilute the AMX win. Pure keyword lookups have no embedding/prefill cost. RAG hits the sweet spot.
+
+**Why Milvus:**  
+Milvus is the leading open-source vector database for enterprise RAG stacks — recognizable to the Xeon target audience and realistic for production deployments. Its HNSW index uses Intel-optimized BLAS for distance computations, and Milvus Standalone deploys as a single Docker container alongside the existing vLLM containers. The `pymilvus` SDK mirrors the OpenAI SDK pattern already used by the LLM benchmark client, keeping the code cohesive.
 
 ---
 
@@ -39,27 +68,29 @@ If any of these flags are missing the AMX image will still run, but AMX tile uni
 ├── build_docker_amx.sh         # Build the AMX image
 ├── build_docker_no_amx.sh      # Build the no-AMX image
 │
-├── ── LLM Inference Demo (existing) ──────────────────────────────────────────
-├── start_amx_containers.sh     # Launch both LLM containers and wait for health
-├── stop_amx_containers.sh      # Stop both LLM containers
-├── restart_amx_containers.sh   # Restart both LLM containers and wait for health
+├── ── Track A: LLM Inference Demo ─────────────────────────────────────────────
+├── start_amx_containers.sh     # Launch LLM containers (ports 8000/8001) and wait for health
+├── stop_amx_containers.sh      # Stop LLM containers
+├── restart_amx_containers.sh   # Restart LLM containers and wait for health
 ├── show_docker.sh              # List Docker images and running containers
 ├── check_vllm_services.sh      # Poll health endpoints until both are ready
 ├── test_vLLM.sh                # Quick smoke test — sends "Hello" to each container
 ├── benchmark_amx.sh            # Automated benchmark runner (wraps query_vllm_amx.py)
 ├── query_vllm_amx.py           # Python benchmark client — TTFT, prefill tok/s, decode tok/s
-├── PWI-Flask-2vLLM.py          # Flask demo app v1 — select service & question in browser
-├── PWI-Flask-2vLLM-v2.py       # Flask demo app v2 — multi-run, cache-busted, richer metrics
+├── PWI-Flask-2vLLM.py          # Flask demo v1 — select service & question in browser
+├── PWI-Flask-2vLLM-v2.py       # Flask demo v2 — multi-run, cache-busted, richer metrics
 │
-└── ── RAG + VectorDB Demo (new) ───────────────────────────────────────────────
-    ├── docker-compose.rag.yml  # All services: Milvus + 4 vLLM containers
+└── ── Track B: RAG + VectorDB Demo ────────────────────────────────────────────
+    ├── docker-compose.rag.yml  # Milvus standalone + all 4 vLLM containers
     ├── start_rag_demo.sh       # One-command start for all RAG demo services
     ├── stop_rag_demo.sh        # Stop all RAG demo services
     ├── rag_corpus.py           # Generates 100-doc synthetic corpus (5 topic clusters)
     ├── rag_index_amx.py        # Embed corpus, benchmark AMX vs no-AMX throughput, index Milvus
     ├── rag_query_amx.py        # Full RAG query: embed → search → generate (AMX vs no-AMX)
-    └── PWI-Flask-RAG.py        # Browser demo: Indexing + RAG Query + LLM Inference tabs
+    └── PWI-Flask-RAG.py        # Browser demo: Indexing + RAG Query + LLM Inference (port 5002)
 ```
+
+> **Tip:** Both tracks share the same two Docker images. Track B adds Milvus and two additional vLLM embedding containers on top of Track A.
 
 ---
 
@@ -85,11 +116,9 @@ bash ../build_docker_amx.sh
 bash ../build_docker_no_amx.sh
 ```
 
-The scripts are thin wrappers around:
-
-| Image tag           | Key build args                                          |
-|---------------------|---------------------------------------------------------|
-| `vllm-cpu-amx:latest`    | `VLLM_CPU_AMXBF16=1 VLLM_CPU_AVX512BF16=1 VLLM_CPU_AVX512VNNI=1` |
+| Image tag | Key build args |
+|---|---|
+| `vllm-cpu-amx:latest` | `VLLM_CPU_AMXBF16=1 VLLM_CPU_AVX512BF16=1 VLLM_CPU_AVX512VNNI=1` |
 | `vllm-cpu-no-amx:latest` | `VLLM_CPU_AMXBF16=0 VLLM_CPU_AVX512BF16=1 VLLM_CPU_AVX512VNNI=1` |
 
 Confirm both images exist:
@@ -102,55 +131,50 @@ bash show_docker.sh
 
 ## Step 2 — Environment Variables
 
-Export your Hugging Face token before starting containers:
-
 ```bash
 export HF_TOKEN=hf_...
+
+# RAG track only — override model defaults if needed
+export VLLM_LLM_MODEL=ibm-granite/granite-3.3-8b-instruct   # default
+export VLLM_EMBED_MODEL=BAAI/bge-m3                          # default
 ```
 
-The model used by default is `ibm-granite/granite-3.3-8b-instruct` (BF16, ~16 GB). Weights are cached in `~/.cache/huggingface` and mounted into each container.
+The LLM model (`ibm-granite/granite-3.3-8b-instruct`, BF16, ~16 GB) and embedding model (`BAAI/bge-m3`, BF16, ~1.5 GB) weights are cached in `~/.cache/huggingface` and mounted into each container.
 
 ---
 
-## Step 3 — Start the Containers
+## Track A — LLM Inference Demo
+
+### Step 3A — Start the LLM Containers
 
 ```bash
 bash start_amx_containers.sh
 ```
 
-This launches two detached containers and blocks until both `/health` endpoints respond:
+Launches two detached containers and waits for both `/health` endpoints:
 
-| Container      | Port | ISA                    |
-|----------------|------|------------------------|
-| `vllm-amx`     | 8000 | `AVX512_CORE_AMX`      |
-| `vllm-no-amx`  | 8001 | `AVX512_CORE_BF16`     |
+| Container | Port | ISA |
+|---|---|---|
+| `vllm-amx` | 8000 | `AVX512_CORE_AMX` |
+| `vllm-no-amx` | 8001 | `AVX512_CORE_BF16` |
 
 The AMX container binds OMP threads to cores 0–19; the no-AMX container to cores 20–39. Adjust `VLLM_CPU_OMP_THREADS_BIND` in the script to match your socket/NUMA topology.
 
----
-
-## Step 4 — Verify the Containers
+### Step 4A — Verify the Containers
 
 ```bash
-# Check both health endpoints
-bash check_vllm_services.sh
-
-# Quick functional smoke test (sends "Hello", expects ≤10 tokens back)
-bash test_vLLM.sh
-
-# Show running containers and images
-bash show_docker.sh
+bash check_vllm_services.sh          # poll /health endpoints
+bash test_vLLM.sh                    # smoke test — sends "Hello"
+bash show_docker.sh                  # list running containers
 ```
 
-### Verify oneDNN kernel dispatch with `DNNL_VERBOSE`
+#### Verify oneDNN kernel dispatch with `DNNL_VERBOSE`
 
-`DNNL_VERBOSE` controls oneDNN's kernel-selection logging. It is set to `0` (silent) by default in `start_amx_containers.sh`. To confirm that the AMX container is actually dispatching AMX kernels, restart it with `DNNL_VERBOSE=1`:
+To confirm the AMX container is dispatching AMX kernels, restart it with `DNNL_VERBOSE=1`:
 
 ```bash
-# Stop the running AMX container first
 docker stop vllm-amx
 
-# Relaunch with verbose oneDNN logging, capturing output
 docker run --rm \
   --name vllm-amx-verbose \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
@@ -170,33 +194,29 @@ docker run --rm \
   --dtype bfloat16 2>&1 | grep -i "avx512_core_amx"
 ```
 
-While the container is handling a request, lines like the following confirm AMX kernels are being dispatched:
+While the container handles a request, lines like the following confirm AMX kernels are active:
 
 ```
 dnnl_verbose,exec,cpu,matmul,...,avx512_core_amx,...
 ```
 
-For the no-AMX container the same lines will show `avx512_core_bf16` instead — confirming AMX tile units are correctly disabled:
+The no-AMX container shows `avx512_core_bf16` instead — confirming AMX is correctly disabled:
 
 ```
 dnnl_verbose,exec,cpu,matmul,...,avx512_core_bf16,...
 ```
 
-Set `DNNL_VERBOSE=0` (the default) for normal operation — verbose logging adds overhead and produces large amounts of output under load.
+Set `DNNL_VERBOSE=0` (the default) for normal operation — verbose logging adds overhead.
 
----
-
-## Step 5 — Run the Benchmark
-
-### Automated runner
+### Step 5A — Run the LLM Benchmark
 
 ```bash
 bash benchmark_amx.sh
 ```
 
-Runs the **RAG / summarization** scenario by default (2 K-token prompt, 50-token answer) — the most realistic test case for showing AMX value.
+Runs a 2K-token prompt / 50-token answer scenario — long context so prefill dominates, short output so the AMX TTFT win carries through to a meaningful end-to-end speedup.
 
-### Manual runs with `query_vllm_amx.py`
+#### Manual runs with `query_vllm_amx.py`
 
 ```bash
 pip install openai rich
@@ -204,12 +224,10 @@ pip install openai rich
 # Default prompt, 3 runs
 python3 query_vllm_amx.py
 
-# Custom prompt, 5 runs, 1-token output (pure prefill, max AMX signal)
+# Custom prompt, 5 runs, 1-token output (pure prefill, maximum AMX signal)
 python3 query_vllm_amx.py \
   --prompt "Explain how AMX tile instructions accelerate transformer prefill." \
-  --runs 5 \
-  --max-tokens 1 \
-  --cooldown 3
+  --runs 5 --max-tokens 1 --cooldown 3
 
 # Custom endpoints (e.g. two separate nodes)
 python3 query_vllm_amx.py \
@@ -240,75 +258,61 @@ python3 query_vllm_amx.py --list-prompts
 | Avg Total Time | TTFT + decode; diluted by output length |
 | Decode throughput (tok/s) | Memory-bandwidth bound — identical for both |
 
----
-
-## RAG + VectorDB AMX Demo
-
-This section showcases AMX benefit across the full retrieval-augmented generation pipeline — embedding generation, vector indexing, and LLM answer synthesis — all on identical hardware with AMX toggled via `DNNL_MAX_CPU_ISA`.
-
-### Architecture
-
-```
-Synthetic corpus (rag_corpus.py — 100 docs, 5 topic clusters)
-        │
-        ▼
-[vllm-embed-amx :8002]  vs  [vllm-embed-no-amx :8003]
-  (BAAI/bge-m3 + AMX)          (BAAI/bge-m3, no AMX)
-        │  ← AMX embedding throughput benchmark
-        ▼
-   Milvus :19530  (HNSW index, cosine similarity)
-        │
-        ▼ top-k retrieval
-User Query → embed → search → retrieved chunks
-        │
-        ▼
-[vllm-amx :8000]    vs    [vllm-no-amx :8001]
-  (Granite 8B + AMX)         (Granite 8B, no AMX)
-        │  ← TTFT / total time comparison
-        ▼
-   Streamed answer + metrics
-```
-
-### AMX Benefit by Pipeline Stage
-
-| Stage | Metric | AMX Benefit |
-|---|---|---|
-| Document embedding (indexing) | Docs/sec, avg latency/doc | ~3–6× (transformer GEMM) |
-| Query embedding | Latency per query embed | ~3–6× |
-| Milvus search | Recall latency | Negligible (HNSW, fast already) |
-| LLM TTFT | Time to first token | ~6× (prefill GEMM) |
-| End-to-end RAG | Total user-visible latency | ~3× (50-token answer sweet spot) |
-
-### RAG Demo Quick Start
-
-**Prerequisites:** Docker images already built (see [§ Step 1](#step-1--build-the-docker-images)), `HF_TOKEN` exported.
+### Step 6A — LLM Interactive Demo (Flask)
 
 ```bash
-# 1. Start all services (Milvus + 4 vLLM containers)
-export HF_TOKEN=hf_...
-export VLLM_LLM_MODEL=ibm-granite/granite-3.3-8b-instruct
-export VLLM_EMBED_MODEL=BAAI/bge-m3
-bash start_rag_demo.sh
-
-# 2. Install Python dependencies
-pip install openai pymilvus rich flask
-
-# 3. Index the synthetic corpus into Milvus
-#    (also benchmarks AMX vs no-AMX embedding throughput)
-python3 rag_index_amx.py
-
-# 4. Run a RAG query comparison
-python3 rag_query_amx.py \
-  --question "How does Intel AMX accelerate LLM inference?" \
-  --top-k 5 --max-tokens 50 --runs 3
-
-# 5. Launch the browser demo (3 tabs: Indexing, RAG Query, LLM Inference)
-python3 PWI-Flask-RAG.py
-# open http://localhost:5002
-
-# 6. Stop everything when done
-bash stop_rag_demo.sh
+python3 PWI-Flask-2vLLM-v2.py
+# open http://localhost:5001
 ```
+
+Pick a long-context question, watch both containers stream their response side by side, and compare live TTFT and prefill tok/s metrics.
+
+---
+
+## Track B — RAG + VectorDB Demo
+
+### Pipeline Architecture
+
+```
+rag_corpus.py → 100 synthetic documents (5 topic clusters)
+                        │
+                        ▼
+        ┌───────────────┴───────────────┐
+        │  INDEXING (one-time setup)    │
+        │                               │
+        │  vllm-embed-amx  :8002        │   AMX embedding
+        │  vllm-embed-noamx :8003       │   no-AMX embedding
+        │  (model: BAAI/bge-m3, 570M)   │
+        │  ← throughput benchmark       │
+        │                               │
+        │  Milvus :19530                │
+        │  (HNSW index, cosine sim)     │
+        └───────────────────────────────┘
+                        │
+                        ▼ at query time
+User question → embed (AMX or no-AMX) → Milvus top-k search
+                        │
+                        ▼
+        RAG prompt = retrieved chunks + question
+                        │
+                        ▼
+        vllm-amx :8000       vllm-noamx :8001
+        (Granite 8B + AMX)   (Granite 8B, no AMX)
+        ← TTFT / total time comparison
+```
+
+### AMX Benefit at Each Stage
+
+| Pipeline stage | Metric | Expected AMX speedup |
+|---|---|---|
+| Document embedding (indexing) | Docs/sec, avg ms/doc | ~3–6× |
+| Query embedding (per request) | Embed latency (ms) | ~3–6× |
+| Milvus HNSW search | Search latency (ms) | Marginal — already fast |
+| LLM TTFT | Time to first token | ~6× |
+| LLM total time (50-token output) | End-to-end request time | ~3× |
+| **End-to-end RAG latency** | **User-visible total** | **~3×** |
+
+The embedding speedup compounds with the LLM prefill speedup: every round-trip in a RAG pipeline — both the encode step and the generate step — benefits from AMX.
 
 ### Service Port Map
 
@@ -316,116 +320,168 @@ bash stop_rag_demo.sh
 |---|---|---|---|
 | `vllm-amx` | 8000 | Granite 8B (LLM) | `AVX512_CORE_AMX` |
 | `vllm-no-amx` | 8001 | Granite 8B (LLM) | `AVX512_CORE_BF16` |
-| `vllm-embed-amx` | 8002 | BAAI/bge-m3 (embed) | `AVX512_CORE_AMX` |
-| `vllm-embed-no-amx` | 8003 | BAAI/bge-m3 (embed) | `AVX512_CORE_BF16` |
+| `vllm-embed-amx` | 8002 | BAAI/bge-m3 (embedding) | `AVX512_CORE_AMX` |
+| `vllm-embed-no-amx` | 8003 | BAAI/bge-m3 (embedding) | `AVX512_CORE_BF16` |
 | `milvus-standalone` | 19530 | — | — |
 
-> **Note:** Running 4 vLLM containers simultaneously is memory-intensive. The two LLM containers (8B model BF16) require ~16 GB each; the two embedding containers (bge-m3 570M BF16) require ~1.5 GB each. Minimum recommended: 64 GB DRAM per socket on a 2-socket system with NUMA binding.
+> **Memory note:** The two LLM containers require ~16 GB DRAM each (8B BF16); the two embedding containers require ~1.5 GB each. Recommended minimum: **64 GB per socket** on a dual-socket system with NUMA-bound thread pinning.
 
-### Corpus Details
+### Step 3B — Start All RAG Services
 
-`rag_corpus.py` generates 100 technical documents (no external dependencies):
+```bash
+bash start_rag_demo.sh
+```
 
-| Topic cluster | Docs | Content |
+Starts Milvus (etcd + MinIO + milvus-standalone) and all four vLLM containers, then waits for every health endpoint. First run downloads model weights (~130 s on 1 Gbps); subsequent starts load from local NVMe cache.
+
+To start Milvus only (e.g., while LLM containers are still loading):
+
+```bash
+bash start_rag_demo.sh --infra-only
+```
+
+### Step 4B — Install Python Dependencies
+
+```bash
+pip install openai pymilvus rich flask
+```
+
+### Step 5B — Index the Corpus
+
+```bash
+python3 rag_index_amx.py
+```
+
+This script:
+1. Loads the 100-document synthetic corpus (`rag_corpus.py`)
+2. Encodes all documents through the **AMX embedding endpoint** — measuring docs/sec and latency
+3. Encodes the same corpus through the **no-AMX embedding endpoint** — for comparison
+4. Prints an AMX vs no-AMX throughput comparison table
+5. Inserts the AMX-generated embeddings into **Milvus** (HNSW index, cosine similarity)
+
+Sample output:
+```
+╔══════════════════════════════════════════════════════╗
+║   AMX VectorDB Indexing Benchmark                    ║
+╚══════════════════════════════════════════════════════╝
+
+Generated 100 synthetic documents in-memory
+
+--- AMX Embedding (port 8002) ---
+  100 docs | avg 45.2ms/doc | 22.1 docs/sec | errors: 0
+
+--- No-AMX Embedding (port 8003) ---
+  100 docs | avg 245.8ms/doc | 4.1 docs/sec | errors: 0
+
+  Embedding Performance
+  ┌───────────────────────────┬────────────┬────────────────┬─────────────┐
+  │ Metric                    │ AMX ✅     │ No AMX (AVX-512)│ AMX Speedup │
+  ├───────────────────────────┼────────────┼────────────────┼─────────────┤
+  │ Avg latency / doc (ms)    │ 45.2ms     │ 245.8ms        │ 5.4x faster │
+  │ Throughput (docs/sec)     │ 22.1       │ 4.1            │ 5.4x higher │
+  │ Total indexing time (s)   │ 4.5s       │ 24.6s          │             │
+  └───────────────────────────┴────────────┴────────────────┴─────────────┘
+
+--- Milvus Indexing (HNSW, dim=1024) ---
+  Inserted 100 documents into Milvus
+  ✅ Index ready: 100 documents in 'amx_rag_demo' collection
+```
+
+#### `rag_index_amx.py` CLI options
+
+| Option | Default | Description |
 |---|---|---|
-| `cpu-architecture` | 20 | ISA extensions, AMX tile architecture, NUMA, caches |
-| `ml-inference` | 20 | Transformers, embeddings, RAG, quantization, batching |
-| `llm-serving` | 20 | vLLM, OpenAI API, Granite/Llama, serving patterns |
-| `data-center` | 20 | Docker, Kubernetes, Milvus, TCO, networking |
-| `intel-amx` | 20 | oneDNN, TDPBF16PS, benchmarking, ISA dispatch |
+| `--amx-embed-url` | `http://localhost:8002` | AMX embedding endpoint |
+| `--no-amx-embed-url` | `http://localhost:8003` | no-AMX embedding endpoint |
+| `--embed-model` | `BAAI/bge-m3` | Embedding model name |
+| `--milvus-host` | `localhost` | Milvus hostname |
+| `--milvus-port` | `19530` | Milvus port |
+| `--corpus-file` | *(in-memory)* | Path to corpus JSON |
+| `--skip-no-amx` | — | Skip no-AMX benchmark, only build index |
+| `--skip-milvus` | — | Benchmark embedding only, do not insert |
 
-Each document is 200–400 words — typical enterprise RAG retrieval chunk size.
-
-### CLI Reference
-
-#### `rag_index_amx.py`
-
-```bash
-python3 rag_index_amx.py [OPTIONS]
-
-Options:
-  --amx-embed-url     AMX embedding endpoint (default: http://localhost:8002)
-  --no-amx-embed-url  no-AMX embedding endpoint (default: http://localhost:8003)
-  --embed-model       Embedding model name (default: BAAI/bge-m3)
-  --milvus-host       Milvus hostname (default: localhost)
-  --milvus-port       Milvus port (default: 19530)
-  --corpus-file       Path to corpus JSON (default: generate in-memory)
-  --skip-no-amx       Skip no-AMX benchmark, only build index
-  --skip-milvus       Benchmark only, do not insert into Milvus
-```
-
-#### `rag_query_amx.py`
+### Step 6B — Run a RAG Query Benchmark
 
 ```bash
-python3 rag_query_amx.py [OPTIONS]
-
-Options:
-  --question          Question to ask (default: first sample question)
-  --top-k             Retrieved chunks to include in prompt (default: 5)
-  --max-tokens        LLM output length (default: 50 — RAG sweet spot)
-  --runs              Benchmark runs per endpoint (default: 3)
-  --cooldown          Seconds between runs (default: 2)
-  --skip-no-amx       Only run AMX path
-  --list-questions    Print sample questions and exit
+python3 rag_query_amx.py \
+  --question "How does Intel AMX accelerate LLM inference?" \
+  --top-k 5 --max-tokens 50 --runs 3
 ```
 
----
+Each run:
+1. Embeds the question with the AMX endpoint → records embed latency
+2. Searches Milvus for top-5 most relevant document chunks
+3. Builds a RAG prompt (system prompt + retrieved context + question)
+4. Streams the answer from the AMX LLM → records TTFT, prefill tok/s, total time
+5. Repeats steps 1 and 4 with the no-AMX endpoints
 
-## Step 6 — Interactive Demo (Flask)
-
-### LLM Inference Demo (original)
-
-A browser-based demo app for live LLM inference demonstrations.
+Reports per-stage and end-to-end latency for both paths.
 
 ```bash
-python3 PWI-Flask-2vLLM-v2.py
-# open http://localhost:5001
+# List sample questions
+python3 rag_query_amx.py --list-questions
 ```
 
-### RAG Demo (new — 3 tabs)
+#### `rag_query_amx.py` CLI options
 
-The full RAG demo combines embedding throughput, vector retrieval, and LLM generation in one UI:
+| Option | Default | Description |
+|---|---|---|
+| `--question` | *(first sample)* | Question to ask |
+| `--top-k` | 5 | Retrieved chunks to include in the prompt |
+| `--max-tokens` | 50 | LLM output length (50 = RAG sweet spot) |
+| `--runs` | 3 | Benchmark runs per path |
+| `--cooldown` | 2 | Seconds between runs |
+| `--skip-no-amx` | — | AMX path only |
+| `--list-questions` | — | Print sample questions and exit |
+
+### Step 7B — RAG Interactive Demo (Flask)
 
 ```bash
 python3 PWI-Flask-RAG.py
 # open http://localhost:5002
 ```
 
-| Tab | What it shows |
+Three tabs in one UI:
+
+| Tab | What it demonstrates |
 |---|---|
-| **① Embedding & Indexing** | AMX vs no-AMX embedding throughput (docs/sec) for the corpus |
-| **② RAG Query** | Full pipeline: embed → Milvus search → LLM answer with per-stage metrics |
-| **③ LLM Inference** | Direct LLM comparison (TTFT, prefill tok/s) — same as existing demo |
+| **① Embedding & Indexing** | Select a sample size → watch AMX encode the corpus faster, see docs/sec and total indexing time comparison |
+| **② RAG Query** | Ask a question → see the retrieved Milvus chunks → watch AMX and no-AMX stream answers side by side with per-stage metrics |
+| **③ LLM Inference** | Direct LLM comparison (no retrieval) — equivalent to the Track A Flask demo |
 
-Select a vLLM service (AMX or no-AMX), pick a question, and watch the streamed response with live TTFT and tokens/sec metrics.
-
-Notes:
-- Long-context prompts so prefill dominates and the AMX advantage is clearly visible
-- Cache busting per run (unique prefix defeats vLLM prefix caching)
+Key implementation notes:
+- Cache busting per run (unique suffix per request defeats vLLM prefix caching)
 - `stream_options: include_usage` for accurate prompt token counts
-- Multiple runs with Avg TTFT, P95 TTFT, Prefill tok/s, Decode tok/s
 - Sequential execution (AMX first, then no-AMX) to avoid DRAM contention noise
-- Default `max_tokens=50` (RAG sweet spot: ~46% prefill, ~3× end-to-end speedup)
+- `max_tokens=50` default (RAG sweet spot: ~46% prefill, ~3× end-to-end speedup)
 
----
+### Corpus Details
 
-## Container Management
+`rag_corpus.py` generates 100 self-contained technical documents — no internet access or external data required:
+
+| Topic cluster | Docs | Content |
+|---|---|---|
+| `cpu-architecture` | 20 | ISA extensions, AMX tile arch, NUMA, cache hierarchy, prefetch |
+| `ml-inference` | 20 | Transformers, embeddings, RAG, quantization, batching, KV cache |
+| `llm-serving` | 20 | vLLM, OpenAI API, Granite/Llama, serving patterns, latency SLOs |
+| `data-center` | 20 | Docker, Kubernetes, Milvus, TCO, networking, observability |
+| `intel-amx` | 20 | oneDNN, TDPBF16PS, benchmarking, ISA dispatch, Sapphire Rapids |
+
+Documents are 200–400 words each — typical enterprise RAG retrieval chunk size. Topics are chosen so nearly every question in the demo retrieves highly relevant, grounded context from multiple clusters.
+
+### Stop the RAG Stack
 
 ```bash
-# Stop both containers
-bash stop_amx_containers.sh
-
-# Restart both containers (waits for health)
-bash restart_amx_containers.sh
+bash stop_rag_demo.sh
 ```
 
 ---
 
-## Benchmark Results Sample Summary
+## Benchmark Results
 
 Full results and analysis are in [`perftests.md`](perftests.md). Key highlights:
 
-### Context length sweep (`max-tokens=1`, pure prefill, cache-busted)
+### LLM Prefill — Context length sweep (`--max-tokens 1`, pure prefill, cache-busted)
 
 | Prompt tokens | AMX TTFT | No-AMX TTFT | Speedup | AMX Prefill tok/s | No-AMX Prefill tok/s |
 |---:|---:|---:|---:|---:|---:|
@@ -435,20 +491,38 @@ Full results and analysis are in [`perftests.md`](perftests.md). Key highlights:
 | 4,393 | 5,843 ms | 34,857 ms | **6.0×** | 752 | 126 |
 | 8,343 | 12,389 ms | 67,175 ms | **5.4×** | 673 | 124 |
 
-### Realistic workload — 2,666-token prompt (RAG / summarization)
+### LLM End-to-end — 2,666-token prompt, varying output length
 
 | Scenario | Output tokens | TTFT speedup | Total time speedup |
 |---|---:|---:|---:|
 | Pure prefill benchmark | 1 | **6.1×** | **6.1×** |
-| Summarization (RAG sweet spot) | 50 | **6.1×** | **3.3×** |
+| Summarization / RAG (sweet spot) | 50 | **6.1×** | **3.3×** |
 | Detailed answer | 200 | **6.2×** | **1.9×** |
 
 ### Why AMX helps prefill but not decode
 
-- **Prefill** — large matrix multiplications across the full prompt. AMX 16×16 BF16 tile-MACC instructions directly accelerate this compute-bound GEMM phase.
-- **Decode** — one token at a time, loading full weight matrices each step. Memory-bandwidth bound; AMX provides no benefit.
+- **Prefill** — the entire input prompt is processed in parallel as large matrix multiplications. AMX 16×16 BF16 tile-MACC instructions directly accelerate this compute-bound GEMM phase (~6× speedup).
+- **Decode** — one token at a time, loading full weight matrices each step. Memory-bandwidth bound; AMX provides no arithmetic benefit. Both containers are equally constrained by DRAM throughput.
 
-The **50-150 token output / 2,600-token prompt** scenario is the most honest demo: it represents a genuine RAG or document Q&A workload and delivers a meaningful **3.3× end-to-end speedup** (7.5 s → 25 s) that users can feel.
+The **50-token output / 2,600-token prompt** scenario is the most honest demo: it represents a genuine RAG or document Q&A workload and delivers a **3.3× end-to-end speedup** (7.5 s → 25 s) that users can feel — while the 6.1× TTFT difference (3.5 s → 21 s) directly translates to perceived responsiveness.
+
+---
+
+## Container Management
+
+```bash
+# ── Track A (LLM only) ──────────────────────────────
+bash stop_amx_containers.sh
+bash restart_amx_containers.sh
+
+# ── Track B (RAG stack: Milvus + 4 vLLM containers) ─
+bash stop_rag_demo.sh
+bash start_rag_demo.sh
+
+# ── Inspect running containers ───────────────────────
+bash show_docker.sh
+docker compose -f docker-compose.rag.yml ps
+```
 
 ---
 
